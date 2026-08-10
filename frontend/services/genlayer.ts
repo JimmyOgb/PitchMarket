@@ -10,6 +10,7 @@ export const MARKET_CONTRACT_ADDRESS =
   "0x0B7CB2FEbf680dC2b5d1b60a374b5D9d5aE269f3" as Address;
 
 const GENLAYER_RPC_PROXY = "/api/genlayer-rpc";
+const STUDIONET_RPC_URL = "https://studio.genlayer.com/api";
 const READ_CACHE_TTL_MS = 30_000;
 
 type ReadCacheEntry = {
@@ -56,23 +57,104 @@ export function clearMarketReadCache() {
 
 type ClientConfig = NonNullable<Parameters<typeof createClient>[0]>;
 type WalletProvider = NonNullable<ClientConfig["provider"]>;
-type WalletWindow = Window & { ethereum?: WalletProvider };
+type WalletWindow = Window & {
+  ethereum?: WalletProvider;
+  okxwallet?: { ethereum?: WalletProvider };
+};
 
 function getWalletProvider(): WalletProvider {
   if (typeof window === "undefined") {
     throw new Error("A browser wallet is required for this operation.");
   }
 
-  const provider = (window as WalletWindow).ethereum;
+  const walletWindow = window as WalletWindow;
+  const provider =
+    walletWindow.ethereum ?? walletWindow.okxwallet?.ethereum;
   if (!provider) {
     throw new Error("No compatible browser wallet was found.");
+  }
+
+  // genlayer-js 1.1.8 reads window.ethereum inside client.connect().
+  // OKX exposes the same EIP-1193 provider as window.okxwallet.ethereum.
+  if (!walletWindow.ethereum && walletWindow.okxwallet?.ethereum) {
+    walletWindow.ethereum = walletWindow.okxwallet.ethereum;
   }
 
   return provider;
 }
 
+function isUnsupportedSnapMethod(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    code === 4200 ||
+    code === -32601 ||
+    /wallet_getSnaps|wallet_requestSnaps|unsupported|not supported|method not found/i.test(
+      message,
+    )
+  );
+}
+
+function isUnknownChainError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return code === 4902 || /unrecognized chain|unknown chain/i.test(message);
+}
+
+async function ensureWalletOnStudionet(provider: WalletProvider) {
+  const expectedChainId = `0x${studionet.id.toString(16)}`;
+  const currentChainId = await provider.request({ method: "eth_chainId" });
+
+  if (currentChainId !== expectedChainId) {
+    try {
+      await provider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: expectedChainId }],
+      });
+    } catch (error: unknown) {
+      if (!isUnknownChainError(error)) throw error;
+
+      await provider.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: expectedChainId,
+            chainName: studionet.name,
+            nativeCurrency: studionet.nativeCurrency,
+            rpcUrls: [STUDIONET_RPC_URL],
+            blockExplorerUrls: [
+              studionet.blockExplorers?.default.url,
+            ],
+          },
+        ],
+      });
+      await provider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: expectedChainId }],
+      });
+    }
+  }
+
+  const verifiedChainId = await provider.request({ method: "eth_chainId" });
+  if (verifiedChainId !== expectedChainId) {
+    throw new Error(
+      `Wallet is on chain ${verifiedChainId}, but PitchMarket requires GenLayer Studionet (${studionet.id}).`,
+    );
+  }
+
+  console.info("[PM-WALLET] CLIENT_CHAIN_ID:", studionet.id);
+  console.info("[PM-WALLET] WALLET_CHAIN_ID:", studionet.id);
+}
+
 async function createWalletClient() {
   const provider = getWalletProvider();
+  await ensureWalletOnStudionet(provider);
   const accounts = await provider.request({ method: "eth_accounts" });
   const account = Array.isArray(accounts) ? accounts[0] : undefined;
 
@@ -84,8 +166,17 @@ async function createWalletClient() {
     chain: studionet,
     account: account as Address,
     provider,
-    endpoint: GENLAYER_RPC_PROXY,
   });
+
+  try {
+    await client.connect("studionet");
+  } catch (error: unknown) {
+    // OKX implements EIP-1193 network methods but not MetaMask Snap methods.
+    if (!isUnsupportedSnapMethod(error)) throw error;
+    console.info("[PM-WALLET] OKX_SNAP_METHOD_UNSUPPORTED");
+  }
+
+  await ensureWalletOnStudionet(provider);
 
   return client;
 }
