@@ -163,7 +163,7 @@ class PitchMarket(gl.Contract):
 
         bettor = gl.message.sender_address
         if bettor == market.creator and outcome != market.creator_outcome:
-            raise gl.vm.UserError("Bet must oppose the creator outcome")
+            raise gl.vm.UserError("Creator may only bet on the creator outcome")
         bet_key = self._bet_key(market_id, bettor)
         if bet_key in self.bets:
             raise gl.vm.UserError("Address has already bet on this market")
@@ -216,11 +216,15 @@ class PitchMarket(gl.Contract):
                 continue
 
             bet.entitlement = u256(0)
-            if market.status == MARKET_STATUS_VOID or winning_total == u256(0):
+            if market.status == MARKET_STATUS_VOID:
                 bet.entitlement = bet.amount
                 bet.settlement_state = BET_SETTLEMENT_REFUND_PENDING
                 has_refunds = True
-            elif bet.outcome == market.outcome:
+            elif (
+                market.status == MARKET_STATUS_RESOLVED
+                and winning_total > u256(0)
+                and bet.outcome == market.outcome
+            ):
                 losing_total = u256(market.total_staked - winning_total)
                 bet.entitlement = u256(
                     bet.amount + (bet.amount * losing_total // winning_total)
@@ -301,9 +305,13 @@ Trusted source content:
 
 Return only this JSON object with no markdown or additional text:
 {{
+  "fixture_id": string,
+  "home_team": string,
+  "away_team": string,
   "status": "resolved" | "unresolved" | "void",
   "home_goals": integer,
   "away_goals": integer,
+  "outcome": 0 | 1 | 2 | 3,
   "void_reason": string
 }}
 
@@ -316,34 +324,62 @@ fields to -1. Never infer missing facts.
                 response_format="json",
             )
 
+            if not isinstance(result, dict):
+                raise gl.vm.UserError("[LLM_ERROR] Result is not an object")
+
+            fixture_id = str(result.get("fixture_id", "")).strip()
+            home_team = str(result.get("home_team", "")).strip()
+            away_team = str(result.get("away_team", "")).strip()
+            if not fixture_id or not home_team or not away_team:
+                raise gl.vm.UserError(
+                    "[LLM_ERROR] Missing fixture identity or team names"
+                )
+
             status = str(result.get("status", "")).strip().lower()
             void_reason = str(result.get("void_reason", "")).strip()
+            home_goals = result.get("home_goals")
+            away_goals = result.get("away_goals")
+            reported_outcome = result.get("outcome")
 
             if status == MARKET_STATUS_RESOLVED:
-                try:
-                    home_goals = int(result.get("home_goals", -1))
-                    away_goals = int(result.get("away_goals", -1))
-                except (TypeError, ValueError):
+                if (
+                    isinstance(home_goals, bool)
+                    or not isinstance(home_goals, int)
+                    or isinstance(away_goals, bool)
+                    or not isinstance(away_goals, int)
+                ):
                     raise gl.vm.UserError("[LLM_ERROR] Invalid goal values")
-
                 if home_goals < 0 or away_goals < 0:
                     raise gl.vm.UserError("[LLM_ERROR] Invalid final score")
 
                 if home_goals > away_goals:
-                    outcome = OUTCOME_HOME_WIN
+                    derived_outcome = OUTCOME_HOME_WIN
                 elif home_goals == away_goals:
-                    outcome = OUTCOME_DRAW
+                    derived_outcome = OUTCOME_DRAW
                 else:
-                    outcome = OUTCOME_AWAY_WIN
+                    derived_outcome = OUTCOME_AWAY_WIN
+
+                if (
+                    isinstance(reported_outcome, bool)
+                    or not isinstance(reported_outcome, int)
+                ):
+                    raise gl.vm.UserError("[LLM_ERROR] Missing result outcome")
+                outcome = derived_outcome
 
                 final_score = f"{home_goals}:{away_goals}"
                 void_reason = ""
             elif status == MARKET_STATUS_VOID:
+                if home_goals != -1 or away_goals != -1:
+                    raise gl.vm.UserError("[LLM_ERROR] Void fixture has scores")
+                if reported_outcome != OUTCOME_UNRESOLVED:
+                    raise gl.vm.UserError("[LLM_ERROR] Invalid void outcome")
                 outcome = OUTCOME_UNRESOLVED
                 final_score = ""
                 if not void_reason:
                     raise gl.vm.UserError("[LLM_ERROR] Missing void reason")
             elif status == "unresolved":
+                if reported_outcome != OUTCOME_UNRESOLVED:
+                    raise gl.vm.UserError("[LLM_ERROR] Invalid unresolved outcome")
                 outcome = OUTCOME_UNRESOLVED
                 final_score = ""
                 void_reason = ""
@@ -351,9 +387,14 @@ fields to -1. Never infer missing facts.
                 raise gl.vm.UserError("[LLM_ERROR] Invalid fixture status")
 
             normalized_result = {
+                "away_team": away_team,
+                "away_goals": away_goals,
                 "final_score": final_score,
-                "fixture_id": market.fixture_id,
+                "fixture_id": fixture_id,
+                "home_team": home_team,
+                "home_goals": home_goals,
                 "outcome": outcome,
+                "reported_outcome": reported_outcome,
                 "resolution_source": TRUSTED_MATCH_DATA_SOURCE,
                 "status": status,
                 "void_reason": void_reason,
@@ -368,8 +409,8 @@ fields to -1. Never infer missing facts.
             resolve_from_trusted_web,
             principle="""
 Both results must be valid normalized JSON and exactly agree on fixture_id,
-status, outcome, final_score, resolution_source, and void_reason. Reject any
-difference in those fields.
+status, outcome, reported_outcome, final_score, resolution_source, and
+void_reason. Reject any difference in those fields.
 """,
         )
 
@@ -390,6 +431,10 @@ difference in those fields.
 
         if str(settlement.get("fixture_id", "")).strip() != market.fixture_id:
             raise gl.vm.UserError("Consensus fixture does not match market")
+        if str(settlement.get("home_team", "")).strip() != market.home_team:
+            raise gl.vm.UserError("Consensus home team does not match market")
+        if str(settlement.get("away_team", "")).strip() != market.away_team:
+            raise gl.vm.UserError("Consensus away team does not match market")
         if (
             str(settlement.get("resolution_source", "")).strip()
             != TRUSTED_MATCH_DATA_SOURCE
@@ -412,8 +457,30 @@ difference in those fields.
                 OUTCOME_AWAY_WIN,
             ):
                 raise gl.vm.UserError("Invalid resolved outcome")
-            if not final_score:
-                raise gl.vm.UserError("Resolved fixture is missing final score")
+            home_goals = settlement.get("home_goals")
+            away_goals = settlement.get("away_goals")
+            if (
+                isinstance(home_goals, bool)
+                or not isinstance(home_goals, int)
+                or isinstance(away_goals, bool)
+                or not isinstance(away_goals, int)
+                or home_goals < 0
+                or away_goals < 0
+            ):
+                raise gl.vm.UserError("Invalid resolved fixture scores")
+            expected_score = f"{home_goals}:{away_goals}"
+            if final_score != expected_score:
+                raise gl.vm.UserError("Resolved fixture score is not canonical")
+            if home_goals > away_goals:
+                expected_outcome = OUTCOME_HOME_WIN
+            elif home_goals == away_goals:
+                expected_outcome = OUTCOME_DRAW
+            else:
+                expected_outcome = OUTCOME_AWAY_WIN
+            if settlement_outcome != expected_outcome:
+                raise gl.vm.UserError("Resolved outcome contradicts final score")
+            if settlement.get("reported_outcome") != expected_outcome:
+                raise gl.vm.UserError("Reported outcome contradicts final score")
             void_reason = ""
         else:
             if settlement_outcome != OUTCOME_UNRESOLVED:

@@ -324,14 +324,21 @@ export default function MarketsPage() {
       const transactionHash = await placeBet(marketId, selectedOutcome, amount);
       console.log("[PM-POSTBET] HASH:", transactionHash);
 
-      const optimisticTotal = asBigInt(selectedMarket.total_staked) + amount;
       setMarkets((currentMarkets) =>
         currentMarkets.map((currentMarket) =>
           String(currentMarket.market_id) === String(marketId)
-            ? { ...currentMarket, total_staked: optimisticTotal }
+            ? {
+                ...currentMarket,
+                // This is the state rendered by the market cards. Update it
+                // from the current card value so a prior read cannot make
+                // the optimistic pool stale or overwrite another bet.
+                total_staked: asBigInt(currentMarket.total_staked) + amount,
+                status: "active",
+              }
             : currentMarket,
         ),
       );
+      const optimisticTotal = asBigInt(selectedMarket.total_staked) + amount;
       console.log("[PM-OPTIMISTIC-BET] MARKET_ID:", String(marketId));
       console.log("[PM-OPTIMISTIC-BET] BET_AMOUNT:", amount.toString());
       console.log("[PM-OPTIMISTIC-BET] NEW_TOTAL:", optimisticTotal.toString());

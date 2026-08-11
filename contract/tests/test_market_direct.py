@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 import pytest
 
@@ -78,7 +79,7 @@ def test_creator_cannot_bet_against_own_outcome(
 
     direct_vm.sender = direct_alice
     direct_vm.value = WEI_PER_GEN
-    with direct_vm.expect_revert("Bet must oppose the creator outcome"):
+    with direct_vm.expect_revert("Creator may only bet on the creator outcome"):
         contract.place_bet(0, 1)
 
     market = contract.get_market(0)
@@ -117,7 +118,7 @@ def test_rejected_creator_bet_does_not_mutate_accounting(
 
     direct_vm.sender = direct_alice
     direct_vm.value = WEI_PER_GEN
-    with direct_vm.expect_revert("Bet must oppose the creator outcome"):
+    with direct_vm.expect_revert("Creator may only bet on the creator outcome"):
         contract.place_bet(0, 1)
 
     market = contract.get_market(0)
@@ -177,3 +178,186 @@ def test_invalid_outcome_rejected(
     direct_vm.value = WEI_PER_GEN
     with direct_vm.expect_revert("Invalid outcome"):
         contract.place_bet(0, bad_outcome)
+
+
+def mock_resolution(direct_vm, result):
+    direct_vm.mock_web(
+        r".*v3\.football\.api-sports\.io/fixtures\?id=12345.*",
+        {"status": 200, "body": "authoritative fixture payload"},
+    )
+    direct_vm.mock_llm(
+        r".*Extract the final status and score.*",
+        json.dumps(result) if not isinstance(result, str) else result,
+    )
+
+
+def resolution_result(
+    *,
+    fixture_id="12345",
+    home_team="Home FC",
+    away_team="Away FC",
+    status="resolved",
+    home_goals=2,
+    away_goals=1,
+    outcome=None,
+    void_reason="",
+):
+    if outcome is None:
+        if status == "resolved" and isinstance(home_goals, int) and isinstance(away_goals, int):
+            outcome = 0 if home_goals > away_goals else 1 if home_goals == away_goals else 2
+        elif status == "resolved":
+            outcome = 0
+        else:
+            outcome = 3
+    return {
+        "fixture_id": fixture_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "status": status,
+        "home_goals": home_goals,
+        "away_goals": away_goals,
+        "outcome": outcome,
+        "void_reason": void_reason,
+    }
+
+
+def prepare_resolution(direct_vm, contract, sender, amount=WEI_PER_GEN, outcome=0):
+    place(direct_vm, contract, sender, amount, outcome)
+    # gltest 0.29.2's warp updates datetime.now() but not message_raw.datetime.
+    # Set the VM transaction timestamp explicitly for this payable contract.
+    direct_vm._datetime = "2100-01-01T00:00:00Z"
+    import genlayer.gl as runtime_gl
+
+    runtime_gl.message_raw["datetime"] = direct_vm._datetime
+
+
+def test_resolved_market_with_no_winning_stake_has_no_refund_entitlement(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=1)
+    mock_resolution(direct_vm, resolution_result(home_goals=2, away_goals=1))
+
+    contract.resolve(0)
+
+    market = contract.get_market(0)
+    assert market.status == "resolved"
+    assert market.outcome == 0
+    assert market.total_staked == WEI_PER_GEN
+    assert market.total_entitled == 0
+    assert contract.get_escrow_balance() >= WEI_PER_GEN
+
+    bet = contract.get_my_bet(0)
+    assert bet.entitlement == 0
+    assert bet.claimed is False
+    assert bet.settlement_state == "not_eligible"
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("no pending settlement entitlement"):
+        contract.claim_winnings(0)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        resolution_result(fixture_id="99999"),
+        resolution_result(fixture_id=""),
+        resolution_result(home_team="Other FC"),
+        resolution_result(away_team="Other FC"),
+        resolution_result(status="unresolved", home_goals=-1, away_goals=-1),
+        resolution_result(home_goals=-1),
+        resolution_result(home_goals="2"),
+        resolution_result(home_goals=2, away_goals=2, outcome=0),
+    ],
+)
+def test_invalid_resolution_leaves_market_unchanged(
+    direct_vm, direct_deploy, direct_alice, direct_bob, result
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=0)
+    before = contract.get_market(0)
+    mock_resolution(direct_vm, result)
+
+    with direct_vm.expect_revert():
+        contract.resolve(0)
+
+    after = contract.get_market(0)
+    assert after == before
+    assert contract.get_escrow_balance() >= before.total_staked
+
+
+def test_unavailable_result_source_leaves_market_unchanged(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=0)
+    before = contract.get_market(0)
+
+    with direct_vm.expect_revert():
+        contract.resolve(0)
+
+    assert contract.get_market(0) == before
+
+
+def test_malformed_result_json_leaves_market_unchanged(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=0)
+    before = contract.get_market(0)
+    mock_resolution(direct_vm, "not-json")
+
+    with direct_vm.expect_revert():
+        contract.resolve(0)
+
+    assert contract.get_market(0) == before
+
+
+@pytest.mark.parametrize(
+    "result, expected_outcome",
+    [
+        (resolution_result(home_goals=2, away_goals=1), 0),
+        (resolution_result(home_goals=1, away_goals=2), 2),
+        (resolution_result(home_goals=1, away_goals=1), 1),
+    ],
+)
+def test_valid_final_results_resolve_deterministically(
+    direct_vm,
+    direct_deploy,
+    direct_alice,
+    direct_bob,
+    result,
+    expected_outcome,
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=expected_outcome)
+    mock_resolution(direct_vm, result)
+
+    contract.resolve(0)
+
+    market = contract.get_market(0)
+    assert market.status == "resolved"
+    assert market.outcome == expected_outcome
+    assert market.final_score == f"{result['home_goals']}:{result['away_goals']}"
+
+
+def test_cancelled_fixture_becomes_void_and_preserves_liability(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, outcome=0)
+    mock_resolution(
+        direct_vm,
+        resolution_result(
+            status="void", home_goals=-1, away_goals=-1, void_reason="abandoned"
+        ),
+    )
+
+    contract.resolve(0)
+
+    market = contract.get_market(0)
+    assert market.status == "void"
+    assert market.total_staked == WEI_PER_GEN
+    assert contract.get_my_bet(0).entitlement == WEI_PER_GEN
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("External payout confirmation is unavailable"):
+        contract.claim_winnings(0)

@@ -7,7 +7,7 @@ import type {
 } from "genlayer-js/types";
 
 export const MARKET_CONTRACT_ADDRESS =
-  "0x0B7CB2FEbf680dC2b5d1b60a374b5D9d5aE269f3" as Address;
+  "0x689C08fa3643C0c8C563417Ea9AE4Af11F031961" as Address;
 
 const GENLAYER_RPC_PROXY = "/api/genlayer-rpc";
 const STUDIONET_RPC_URL = "https://studio.genlayer.com/api";
