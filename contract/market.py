@@ -24,8 +24,18 @@ BET_SETTLEMENT_UNSETTLED = "unsettled"
 BET_SETTLEMENT_PAYOUT_PENDING = "payout_pending"
 BET_SETTLEMENT_REFUND_PENDING = "refund_pending"
 BET_SETTLEMENT_NOT_ELIGIBLE = "not_eligible"
+BET_SETTLEMENT_CLAIMED = "claimed"
 
 TRUSTED_MATCH_DATA_SOURCE = "api-football"
+
+
+@gl.evm.contract_interface
+class _Recipient:
+    class View:
+        pass
+
+    class Write:
+        pass
 
 
 @allow_storage
@@ -225,9 +235,8 @@ class PitchMarket(gl.Contract):
                 and winning_total > u256(0)
                 and bet.outcome == market.outcome
             ):
-                losing_total = u256(market.total_staked - winning_total)
                 bet.entitlement = u256(
-                    bet.amount + (bet.amount * losing_total // winning_total)
+                    bet.amount * market.total_staked // winning_total
                 )
                 bet.settlement_state = BET_SETTLEMENT_PAYOUT_PENDING
                 has_payouts = True
@@ -503,14 +512,39 @@ void_reason. Reject any difference in those fields.
 
         return consensus_result
 
+    def _emit_settlement(self, market: Market, bet: Bet, amount: u256) -> None:
+        if amount == u256(0):
+            raise gl.vm.UserError("Settlement amount must be greater than zero")
+        if amount > bet.entitlement:
+            raise gl.vm.UserError("Settlement exceeds bettor entitlement")
+        if market.total_paid_out + amount > market.total_staked:
+            raise gl.vm.UserError("Settlement exceeds market stake")
+        if amount > self.outstanding_liabilities:
+            raise gl.vm.UserError("Settlement exceeds outstanding liabilities")
+        if amount > self.balance:
+            raise gl.vm.UserError("Insufficient escrow balance")
+
+        # External messages to EOAs are finalization-only. The documented
+        # runtime deducts value from this IC when the message is emitted and
+        # executes the EOA transfer through the IC ghost at finalization.
+        _Recipient(bet.bettor).emit_transfer(value=u256(amount))
+
+        bet.claimed = True
+        bet.settlement_state = BET_SETTLEMENT_CLAIMED
+        market.total_paid_out = u256(market.total_paid_out + amount)
+        self.outstanding_liabilities = u256(
+            self.outstanding_liabilities - amount
+        )
+        self.bets[self._bet_key(market.market_id, bet.bettor)] = bet
+
     @gl.public.write
     def claim_winnings(self, market_id: u256) -> None:
         if market_id not in self.markets:
             raise gl.vm.UserError("Market does not exist")
 
         market = self.markets[market_id]
-        if market.status not in (MARKET_STATUS_RESOLVED, MARKET_STATUS_VOID):
-            raise gl.vm.UserError("Market is not settled")
+        if market.status != MARKET_STATUS_RESOLVED:
+            raise gl.vm.UserError("Market is not resolved")
 
         bet_key = self._bet_key(market_id, gl.message.sender_address)
         if bet_key not in self.bets:
@@ -519,15 +553,43 @@ void_reason. Reject any difference in those fields.
         bet = self.bets[bet_key]
         if bet.claimed:
             raise gl.vm.UserError("Winnings have already been claimed")
-        if bet.settlement_state not in (
-            BET_SETTLEMENT_PAYOUT_PENDING,
-            BET_SETTLEMENT_REFUND_PENDING,
-        ):
-            raise gl.vm.UserError("Bettor has no pending settlement entitlement")
+        if bet.settlement_state != BET_SETTLEMENT_PAYOUT_PENDING:
+            raise gl.vm.UserError("Bettor is not eligible for winnings")
+        if bet.outcome != market.outcome:
+            raise gl.vm.UserError("Bettor did not select the winning outcome")
 
-        raise gl.vm.UserError(
-            "External payout confirmation is unavailable; entitlement remains pending"
-        )
+        self._emit_settlement(market, bet, bet.entitlement)
+        market.settlement_state = MARKET_SETTLEMENT_PAYOUT_PENDING
+        if market.total_paid_out == market.total_entitled:
+            market.settlement_state = MARKET_SETTLEMENT_NO_ENTITLEMENTS
+        self.markets[market_id] = market
+
+    @gl.public.write
+    def refund(self, market_id: u256) -> None:
+        if market_id not in self.markets:
+            raise gl.vm.UserError("Market does not exist")
+
+        market = self.markets[market_id]
+        if market.status != MARKET_STATUS_VOID:
+            raise gl.vm.UserError("Market is not void")
+
+        bet_key = self._bet_key(market_id, gl.message.sender_address)
+        if bet_key not in self.bets:
+            raise gl.vm.UserError("Caller has not placed a bet in this market")
+
+        bet = self.bets[bet_key]
+        if bet.claimed:
+            raise gl.vm.UserError("Settlement has already been claimed")
+        if bet.settlement_state != BET_SETTLEMENT_REFUND_PENDING:
+            raise gl.vm.UserError("Bettor has no pending refund")
+        if bet.entitlement != bet.amount:
+            raise gl.vm.UserError("Refund does not equal original stake")
+
+        self._emit_settlement(market, bet, bet.amount)
+        market.settlement_state = MARKET_SETTLEMENT_REFUND_PENDING
+        if market.total_paid_out == market.total_entitled:
+            market.settlement_state = MARKET_SETTLEMENT_NO_ENTITLEMENTS
+        self.markets[market_id] = market
 
     @gl.public.view
     def get_outcome_total(self, market_id: u256, outcome: u256) -> u256:

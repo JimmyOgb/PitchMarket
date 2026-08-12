@@ -83,6 +83,10 @@ export function claimWinnings(marketId: bigint): Promise<TransactionHash> {
   return writeMarketContract("claim_winnings", [marketId]);
 }
 
+export function refund(marketId: bigint): Promise<TransactionHash> {
+  return writeMarketContract("refund", [marketId]);
+}
+
 export function getOutcomeTotal(
   marketId: bigint,
   outcome: MarketOutcome,

@@ -6,8 +6,11 @@ import type {
   TransactionHash,
 } from "genlayer-js/types";
 
+const configuredMarketAddress =
+  process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS;
 export const MARKET_CONTRACT_ADDRESS =
-  "0x689C08fa3643C0c8C563417Ea9AE4Af11F031961" as Address;
+  (configuredMarketAddress ||
+    "0x4657AB79B5404586F033004F88c2cA461c12F47C") as Address;
 
 const GENLAYER_RPC_PROXY = "/api/genlayer-rpc";
 const STUDIONET_RPC_URL = "https://studio.genlayer.com/api";

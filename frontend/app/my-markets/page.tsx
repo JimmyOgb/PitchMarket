@@ -12,6 +12,7 @@ import { SiteHeader } from "@/components/site-header";
 import {
   claimWinnings,
   getMyBet,
+  refund,
   type Bet,
   type Market,
 } from "@/services/market";
@@ -154,6 +155,25 @@ export default function MyMarketsPage() {
     }
   }
 
+  async function handleRefund(market: MyMarket) {
+    if (!market.bet || claimingId) return;
+    setClaimingId(String(market.market_id));
+    try {
+      const transactionHash = await refund(asBigInt(market.market_id));
+      setClaimHashes((hashes) => ({
+        ...hashes,
+        [String(market.market_id)]: String(transactionHash),
+      }));
+      setToast("Refund submitted successfully.");
+      await refetchBalance();
+      await loadMarkets();
+    } catch (error: unknown) {
+      setToast(error instanceof Error ? error.message : "Refund failed.");
+    } finally {
+      setClaimingId(null);
+    }
+  }
+
   const groupedMarkets = useMemo(
     () =>
       GROUPS.reduce<Record<GroupName, MyMarket[]>>(
@@ -229,6 +249,10 @@ export default function MyMarketsPage() {
                           isResolved &&
                           bet &&
                           Number(market.outcome) === Number(bet.outcome) &&
+                          !bet.claimed;
+                        const canRefund =
+                          group === "Void" &&
+                          bet?.settlement_state === "refund_pending" &&
                           !bet.claimed;
 
                         return (
@@ -334,9 +358,22 @@ export default function MyMarketsPage() {
                                 {resultLabel(market, bet)}
                               </p>
                             ) : null}
-                            {group === "Void" && bet ? (
-                              <p className="mt-5 text-sm font-bold text-amber-300">
-                                Refund Pending
+                            {canRefund ? (
+                              <button
+                                className="mt-5 rounded-md bg-amber-300 px-4 py-3 text-sm font-bold text-ink transition hover:bg-white disabled:opacity-60"
+                                disabled={
+                                  claimingId === String(market.market_id)
+                                }
+                                onClick={() => void handleRefund(market)}
+                                type="button"
+                              >
+                                {claimingId === String(market.market_id)
+                                  ? "Transaction pending…"
+                                  : "Refund Stake"}
+                              </button>
+                            ) : group === "Void" && bet?.claimed ? (
+                              <p className="mt-5 flex items-center gap-1.5 text-sm font-bold text-lime">
+                                <CheckCircle2 className="size-4" /> Refunded
                               </p>
                             ) : null}
                             {canClaim ? (

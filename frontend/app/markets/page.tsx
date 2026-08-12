@@ -557,11 +557,6 @@ export default function MarketsPage() {
                                   ? "Not eligible for settlement"
                                   : "Settlement pending"}
                           </p>
-                          {market.bet.settlement_state !== "not_eligible" ? (
-                            <p className="mt-2 text-center text-xs leading-5 text-white/45">
-                              Transfer confirmation unavailable. Your entitlement remains recorded and has not been marked paid.
-                            </p>
-                          ) : null}
                         </>
                       ) : null}
                     </dl>

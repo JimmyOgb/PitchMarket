@@ -231,6 +231,20 @@ def prepare_resolution(direct_vm, contract, sender, amount=WEI_PER_GEN, outcome=
     runtime_gl.message_raw["datetime"] = direct_vm._datetime
 
 
+def restore_betting_time(direct_vm):
+    direct_vm._datetime = "2024-01-01T00:00:00Z"
+    import genlayer.gl as runtime_gl
+
+    runtime_gl.message_raw["datetime"] = direct_vm._datetime
+
+
+def set_resolution_time(direct_vm):
+    direct_vm._datetime = "2100-01-01T00:00:00Z"
+    import genlayer.gl as runtime_gl
+
+    runtime_gl.message_raw["datetime"] = direct_vm._datetime
+
+
 def test_resolved_market_with_no_winning_stake_has_no_refund_entitlement(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
@@ -252,7 +266,7 @@ def test_resolved_market_with_no_winning_stake_has_no_refund_entitlement(
     assert bet.claimed is False
     assert bet.settlement_state == "not_eligible"
     direct_vm.sender = direct_bob
-    with direct_vm.expect_revert("no pending settlement entitlement"):
+    with direct_vm.expect_revert("not eligible for winnings"):
         contract.claim_winnings(0)
 
 
@@ -359,5 +373,88 @@ def test_cancelled_fixture_becomes_void_and_preserves_liability(
     assert market.total_staked == WEI_PER_GEN
     assert contract.get_my_bet(0).entitlement == WEI_PER_GEN
     direct_vm.sender = direct_bob
-    with direct_vm.expect_revert("External payout confirmation is unavailable"):
+    contract.refund(0)
+    assert contract.get_my_bet(0).claimed is True
+    assert contract.get_my_bet(0).settlement_state == "claimed"
+    assert contract.get_market(0).total_paid_out == WEI_PER_GEN
+    assert contract.outstanding_liabilities == 0
+    with direct_vm.expect_revert("already been claimed"):
+        contract.refund(0)
+
+
+def test_winner_claim_updates_state_and_liability_once(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, amount=WEI_PER_GEN, outcome=0)
+    restore_betting_time(direct_vm)
+    place(direct_vm, contract, direct_charlie, 3 * WEI_PER_GEN, outcome=1)
+    mock_resolution(direct_vm, resolution_result(home_goals=2, away_goals=1))
+    set_resolution_time(direct_vm)
+    contract.resolve(0)
+
+    direct_vm.sender = direct_bob
+    contract.claim_winnings(0)
+    bet = contract.get_my_bet(0)
+    assert bet.claimed is True
+    assert bet.settlement_state == "claimed"
+    assert contract.get_market(0).total_paid_out == 4 * WEI_PER_GEN
+    assert contract.outstanding_liabilities == 0
+
+    with direct_vm.expect_revert("already been claimed"):
         contract.claim_winnings(0)
+
+
+def test_loser_and_wrong_recipient_cannot_claim(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, amount=WEI_PER_GEN, outcome=0)
+    restore_betting_time(direct_vm)
+    place(direct_vm, contract, direct_charlie, WEI_PER_GEN, outcome=2)
+    mock_resolution(direct_vm, resolution_result(home_goals=2, away_goals=1))
+    set_resolution_time(direct_vm)
+    contract.resolve(0)
+
+    direct_vm.sender = direct_charlie
+    with direct_vm.expect_revert("not eligible for winnings"):
+        contract.claim_winnings(0)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("has not placed a bet"):
+        contract.claim_winnings(0)
+
+
+def test_void_bettor_cannot_claim_winnings_or_refund_twice(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, amount=2 * WEI_PER_GEN, outcome=0)
+    mock_resolution(
+        direct_vm,
+        resolution_result(status="void", home_goals=-1, away_goals=-1, void_reason="cancelled"),
+    )
+    contract.resolve(0)
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("not resolved"):
+        contract.claim_winnings(0)
+    contract.refund(0)
+    with direct_vm.expect_revert("already been claimed"):
+        contract.refund(0)
+
+
+def test_multiple_winners_use_integer_proportional_formula(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    contract = deploy_market(direct_vm, direct_deploy, direct_alice)
+    prepare_resolution(direct_vm, contract, direct_bob, amount=2 * WEI_PER_GEN, outcome=0)
+    restore_betting_time(direct_vm)
+    place(direct_vm, contract, direct_charlie, WEI_PER_GEN, outcome=0)
+    mock_resolution(direct_vm, resolution_result(home_goals=2, away_goals=1))
+    set_resolution_time(direct_vm)
+    contract.resolve(0)
+    assert contract.get_my_bet(0).entitlement == WEI_PER_GEN
+    direct_vm.sender = direct_bob
+    contract.claim_winnings(0)
+    direct_vm.sender = direct_charlie
+    contract.claim_winnings(0)
+    assert contract.get_market(0).total_paid_out == 3 * WEI_PER_GEN

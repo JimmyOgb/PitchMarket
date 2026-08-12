@@ -12,7 +12,7 @@ const wagmiConfig = createConfig({
   connectors: [injected()],
   ssr: true,
   transports: {
-    [studionet.id]: http(),
+    [studionet.id]: http("/api/genlayer-rpc"),
   },
 });
 
